@@ -1,0 +1,962 @@
+---
+title: "Spatial reconstruction of cortical single astrocyte RNAseq"
+author: "Vitalii Kleshchevnikov"
+date: "27/01/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+suppressPackageStartupMessages({
+  
+  # Install packages
+  #install.packages("BiocManager")
+  #BiocManager::install(c("vitkl/ParetoTI", "qvalue",
+  #                       "monocle", "org.Mm.eg.db"), dependencies=T)
+  
+  library(ParetoTI)
+  library(SingleCellExperiment)
+  library(ggplot2)
+  library(cowplot)
+  library(org.Mm.eg.db)
+  library(Matrix)
+  
+})
+source("./helper_fun.R")
+```
+
+Description of the method: Single-cell spatial reconstruction reveals global division of labour in the mammalian liver   
+
+Supplementary: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5321580/bin/NIHMS70855-supplement-Supplementary_Information.pdf  
+
+Paper: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5321580/
+
+## Choose method and the number of markers
+
+```{r}
+UMI = T
+N_markers = 16
+```
+
+## Load spatial profiles
+
+```{r}
+layer_levels = paste0("Bin", 1:5) # c("L1", "L2-3", "L4", "L5", "L6")
+
+# load measured spatial profile
+spatial_p56 = fread("./data/Omer_astrocytes/20190122_layerAst_P56cor.tsv", stringsAsFactors = F)
+spatial_p56_new = fread("./data/Omer_astrocytes/20190303_layerAst_P56cor2_newgenes.tsv", stringsAsFactors = F)
+spatial_p14 = fread("./data/Omer_astrocytes/20181110_layerAst_P14sag_allgenes.tsv", stringsAsFactors = F)
+
+# add layer to new p56 data
+spatial_p56_new[, layer := gsub("CTX S-BF ", "", segmentation)]
+
+if(N_markers == 16){
+  # mix both
+  spatial_p56 = rbind(spatial_p56[, .(spotcounts, genes, slide, normalisedDepth,
+                                      ctxdepthInterval, cell.id)],
+                      spatial_p56_new[, .(spotcounts, genes, slide, normalisedDepth,
+                                          ctxdepthInterval, cell.id)])
+}
+spatial_p56[, ctxdepthInterval_10 := findInterval(normalisedDepth, seq(0,1,length.out=10+1))]
+# make sure levels are in the correct order
+setorder(spatial_p56, ctxdepthInterval, ctxdepthInterval_10)
+fwrite(spatial_p56, "./data/Omer_astrocytes/p56_mix.csv")
+
+# recode layer names
+spatial_p56[, ctxdepthInterval := paste0("Bin", ctxdepthInterval)]
+spatial_p56[, ctxdepthInterval_10 := paste0("Bin", ctxdepthInterval_10)]
+
+prob_cell_in_layer = function(spatial, layer_col){
+  # calculate the number of cells in each layer
+  spatial_c = copy(spatial)
+  setnames(spatial_c, layer_col, "layer")
+  prior_prop = spatial_c[, .(N_cells = uniqueN(cell.id)), by = .(layer, slide)]
+  prior_prop[, prop_cells := N_cells / sum(N_cells), by = .(slide)]
+  prior_prop = prior_prop[, .(N_cells = mean(N_cells), prop_cells = mean(prop_cells)),
+                          by = list(layer)]
+  
+  setorder(prior_prop, layer)
+  # prior probability for Shalev's method
+  prior_prop
+}
+
+prob_cell_in_layer(spatial_p56, "ctxdepthInterval")
+prob_cell_in_layer(spatial_p56, "ctxdepthInterval_10")
+
+prob_cell_in_layer(spatial_p14, "ctxdepthInterval")
+```
+
+```{r, fig.height=5, fig.width=5}
+library(ggridges)
+p = ggplot(spatial_p56[genes %in% c("Chrdl1", "Il33", "Id3")], aes(x = spotcounts)) +
+geom_histogram() + facet_grid(ctxdepthInterval ~ genes) +
+  theme(strip.text.y = element_text(angle = 0, size = 16),
+        strip.text.x = element_text(angle = 0, size = 16),
+        axis.title = element_text(size = 16)) + xlim(0, 80) + ylim(0, 150)
+
+ggplot2::ggsave(p, width = 5, height = 5, units = "in",
+               device = "svg", path = "./figures_Ntotal180k/poster/",
+               filename = "method1.svg")
+```
+
+```{r, fig.height=1.5, fig.width=2}
+bin = c("Bin1")
+gene = c("Chrdl1") 
+one_dist = spatial_p56[genes %in% gene & ctxdepthInterval %in% bin]
+
+p = ggplot(one_dist, aes(x = spotcounts)) +
+geom_histogram() + facet_grid(ctxdepthInterval ~ genes) +
+  theme(strip.text.y = element_text(angle = 0, size = 16),
+        strip.text.x = element_text(angle = 0, size = 16),
+        axis.title = element_blank()) + xlim(0, 80) + ylim(0, 70)
+p
+ggplot2::ggsave(p, width = 2, height = 1.5, units = "in",
+               device = "svg", path = "./figures_Ntotal180k/poster/",
+               filename = "method2_data.svg")
+
+# find gamma parameters
+gamma_par = MASS::fitdistr(as.numeric(one_dist$spotcounts+0.01), dgamma, list(shape = 1, scale = 15))
+
+# simulate gamma
+N = nrow(one_dist)
+N_molecules = 1
+gr = rgamma(N, shape = gamma_par$estimate["shape"], scale = gamma_par$estimate["scale"]) * N_molecules
+
+# plot original gamma
+gr_dt = data.table(spotcounts = gr, ctxdepthInterval = bin, genes = gene)
+p = ggplot(gr_dt, aes(x = spotcounts)) +
+geom_histogram() + facet_grid(ctxdepthInterval ~ genes) +
+  theme(strip.text.y = element_text(angle = 0, size = 16),
+        strip.text.x = element_text(angle = 0, size = 16),
+        axis.title = element_blank()) + xlim(0, 80) + ylim(0, 70)
+p
+
+# scale back to idealised distribution
+sc_sampling = 0.01
+smFISH_sampling = 0.4
+# plot original gamma
+gr_dt = data.table(spotcounts = gr / smFISH_sampling, ctxdepthInterval = bin, genes = gene)
+p = ggplot(gr_dt, aes(x = spotcounts)) +
+geom_histogram() + facet_grid(ctxdepthInterval ~ genes) +
+  theme(strip.text.y = element_text(angle = 0, size = 16),
+        strip.text.x = element_text(angle = 0, size = 16),
+        axis.title = element_blank()) + xlim(0, 80) + ylim(0, 70)
+p
+ggplot2::ggsave(p, width = 2, height = 1.5, units = "in",
+               device = "svg", path = "./figures_Ntotal180k/poster/",
+               filename = "method2_idealised_gamma.svg")
+
+# simulate poisson
+pr = rpois(length(gr), gr * sc_sampling / smFISH_sampling) 
+
+# plot poisson
+pr_dt = data.table(spotcounts = pr, ctxdepthInterval = bin, genes = gene)
+p = ggplot(pr_dt, aes(x = spotcounts)) +
+geom_histogram() + facet_grid(ctxdepthInterval ~ genes) +
+  theme(strip.text.y = element_text(angle = 0, size = 16),
+        strip.text.x = element_text(angle = 0, size = 16),
+        axis.title = element_blank()) #+ xlim(0, 80) + ylim(0, 70)
+p
+ggplot2::ggsave(p, width = 2, height = 1.5, units = "in",
+               device = "svg", path = "./figures_Ntotal180k/poster/",
+               filename = "method3_gammapoiss.svg")
+
+# simulate negative binomial 
+N = nrow(one_dist)
+N_molecules = 1
+sc_sampling = 0.01
+smFISH_sampling = 0.4
+factor = sc_sampling / smFISH_sampling * N_molecules
+c_theta = factor * gamma_par$estimate["scale"]
+bnr = rnbinom(n = N, size = gamma_par$estimate["shape"], prob = c_theta / (1 + c_theta)) 
+
+# plot NB
+bnr_dt = data.table(spotcounts = bnr, ctxdepthInterval = bin, genes = gene)
+p = ggplot(bnr_dt, aes(x = spotcounts)) +
+geom_histogram() + facet_grid(ctxdepthInterval ~ genes) +
+  theme(strip.text.y = element_text(angle = 0, size = 16),
+        strip.text.x = element_text(angle = 0, size = 16),
+        axis.title = element_blank()) #+ xlim(0, 80) + ylim(0, 70)
+p
+
+# plot gene expression in cells
+if(F){
+  cell_dt = data.table(spotcounts = as.numeric(normcounts(normalised[gene, ])), 
+                       ctxdepthInterval = "sc", genes = gene)
+  p = ggplot(cell_dt, aes(x = spotcounts)) +
+    geom_histogram() + facet_grid(ctxdepthInterval ~ genes) +
+    theme(strip.text.y = element_text(angle = 0, size = 16),
+          strip.text.x = element_text(angle = 0, size = 16),
+          axis.title = element_blank()) #+ xlim(0, 80) + ylim(0, 70)
+  p
+}
+```
+
+## Load scRNA-seq
+
+```{r load_unnormalised, eval=TRUE}
+data = read.table("./data/Holt_astrocytes/HOLTLAB_Counts_Cortex.tsv")
+Type = data["Type",]
+data = as(as.matrix(data[-1,]), "dgCMatrix")
+ss_data = copy(data)
+
+#qplot(Matrix::rowMeans(data), DelayedMatrixStats::rowVars(DelayedArray(data)), geom = "point") + xlim(0, 10000)+ ylim(0, 2e+07)
+
+# map gene identifiers
+annot = map_gene_annot(taxonomy_id = 10090, keys = rownames(data),
+                       columns = "ENSEMBL", keytype = "ALIAS")
+
+if(UMI){
+  # Use monocle 2 Census method to convert smart-seq 2 counts to mRNA molecule counts ---------
+  # First create a CellDataSet from the relative expression levels
+  library(monocle)
+  annot$gene_short_name = annot$ALIAS
+  mono_data = monocle::newCellDataSet(as.matrix(data),
+                                      featureData = new("AnnotatedDataFrame", data = annot),
+                                      lowerDetectionLimit = 0.1,
+                                      expressionFamily = tobit(Lower = 0.1))
+  # Next, use it to estimate RNA counts
+  data = monocle::relative2abs(mono_data, method = "num_genes")
+  
+  # compare original and estimated RNA molecule counts
+  #hist(log10(ss_data@x))
+  #hist(log10(as(as.matrix(data), "dgCMatrix")@x))
+  #qplot(ss_data@x, as(as.matrix(data), "dgCMatrix")@x, geom = "bin2d") +
+  #  xlab("original counts") + ylab("estimated RNA molecule counts")
+  #qplot(ss_data@x, as(as.matrix(data), "dgCMatrix")@x, geom = "bin2d") +
+  #  xlab("original counts") + ylab("estimated RNA molecule counts")+
+  #s  scale_x_log10() + scale_y_log10()
+}
+
+
+# make single cell experiment object using the RNA counts
+normalised = SingleCellExperiment(assays = list(counts = as(as.matrix(data), "dgCMatrix"),
+                                                ss2_counts = ss_data[rownames(data), colnames(data)]),
+                                  rowData = annot)
+normalised$Type = Type
+```
+
+```{r qc_unnormalised}
+# Find size factors and normalise, calculate PCA and TSNE
+normalised = scran::computeSumFactors(normalised)
+normalised = scater::normalize(normalised)
+normalised = scater::normalize(normalised, return_log = F)
+# Find top 6 PCA using 500 most highly variable genes (data has 0 mean and 1 sd before PCA)
+normalised = scater::runPCA(normalised, ncomponents = 6, ntop = 500)
+scater::plotReducedDim(normalised, use_dimred = "PCA", ncomponents = 4)
+
+# remove the weird second cluster - try keeping that cluster in
+## if using UMI
+if(UMI) {
+  normalised = normalised[, reducedDim(normalised, "PCA")[,1] > -15]
+} else {
+  ## if using original smart seq 2 counts
+  normalised = normalised[, reducedDim(normalised, "PCA")[,1] > -12 - 1.5 * reducedDim(normalised, "PCA")[,3]]
+}
+
+
+# look at PCs again
+normalised = scater::runPCA(normalised, ncomponents = 6, ntop = 200)
+#scater::plotReducedDim(normalised, use_dimred = "PCA", ncomponents = 4)
+
+for (gene in unique(spatial_p56$genes)) {
+  print(scater::plotReducedDim(normalised, use_dimred = "PCA", ncomponents = 4, colour_by = gene))
+}
+
+pcs = print(scater::plotReducedDim(normalised, use_dimred = "PCA", ncomponents = c(1,3), colour_by = "Chrdl1"))
+pcs2 = print(scater::plotReducedDim(normalised, use_dimred = "PCA", ncomponents = c(1,3), colour_by = "Id3"))
+pcs3 = print(scater::plotReducedDim(normalised, use_dimred = "PCA", ncomponents = c(1,3), colour_by = "Il33"))
+
+pcs = print(plot_grid(pcs, pcs2, pcs3, nrow = 1))
+ggplot2::ggsave(pcs, width = 9, height = 2.5, units = "in",
+               device = "svg", path = "./figures_Ntotal180k/paper/",
+               filename = "Holt_PCs_layer_markers.svg")
+# mark genes that were measured in space
+#rowData(normalised)$landmark_p14 = rownames(normalised) %in% spatial_p14$genes
+#rowData(normalised)$landmark_p56 = rownames(normalised) %in% spatial_p56$genes
+
+plot_arc(data = t(reducedDim(normalised, "PCA")), which_dimensions = 1:3)
+
+saveRDS(normalised, "./data/Holt_astrocytes/sce_small_clust_removed.RDS")
+```
+
+## Plot Holt clusters and 4 markers in PC plots & joy plots
+
+```{r save_input_Shalev}
+# for Shalev's spatial mapping approach
+selected_genes = Matrix::rowSums(normcounts(normalised) > 0) > 145
+normalised = normalised[selected_genes, ]
+data_mat = as.data.table(as.matrix(normcounts(normalised)))
+# save the matrix
+fwrite(data_mat,
+       paste0("./data/Holt_astrocytes/normalised_expression_mat_UMI_", UMI, ".csv"),
+       col.names = F)
+# save the gene list
+data_dt = data.table(rownames(normalised))
+fwrite(data_dt, 
+       paste0("./data/Holt_astrocytes/normalised_expression_genes_UMI_", UMI, ".csv"),
+       col.names = F)
+
+gplots::heatmap.2(t(as.matrix(logcounts(normalised))[order(rowVars(as.matrix(logcounts(normalised))), decreasing = T)[1:500],
+                                                     order(reducedDim(normalised, "PCA")[,1])]), trace = "none", col = colorRampPalette(RColorBrewer::brewer.pal(9, "YlOrRd"))(100), dendrogram = "none", Rowv = FALSE)
+```
+
+## Load mapping results from matlab
+
+```{r}
+# set analysis name
+if(N_markers == 16 & UMI){
+  analysis_name = "astro_16mark_UMI_Ntotal180000_1000k_out_norm"
+  #analysis_name = "Omer_astrocytes_16mark_mix_nonUMI_Ntotal787054_1000k_non_norm"
+} else if(N_markers == 16 & !UMI) {
+  analysis_name = "astro_16mark_UMI_Ntotal180000_1000k_out_norm"
+} 
+
+gene_names = fread(paste0("./data/Holt_astrocytes/normalised_expression_genes_UMI_", UMI, ".csv"),
+                   header = F)$V1
+
+# load spatial predictions
+zonation_mean = fread(paste0("./spatial_mapping_code/", analysis_name, "/zonation_profile_genes_x_zones.csv"))
+setnames(zonation_mean, colnames(zonation_mean), layer_levels)
+zonation_mean$genes = gene_names
+
+
+zonation_q_val = fread(paste0("./spatial_mapping_code/", analysis_name, "/zonation_profile_q_val_genes_x_1.csv"))
+zonation_q_val$genes = gene_names
+
+zonation_p_val = fread(paste0("./spatial_mapping_code/", analysis_name, "/zonation_profile_p_val_genes_x_1.csv"))
+zonation_p_val$genes = gene_names
+zonation_p_val[, fdr_cor := qvalue::qvalue(V1)$qvalues ]
+zonation_mean_orig = copy(zonation_mean)
+
+# add p-value and q-value
+zonation_mean_orig$q_value = zonation_p_val$fdr_cor
+zonation_mean_orig$p_value = zonation_p_val$V1
+# save
+fwrite(zonation_mean_orig, "./figures_Ntotal180k/Supplementary_table_11.tsv", sep = "\t")
+```
+
+## Plot expression across zones (q-val < 0.05)
+
+```{r, fig.height=2.7, fig.width=20}
+fdr_cor_thresh = 0.1
+# How many genes this gives?
+length(zonation_p_val[fdr_cor < fdr_cor_thresh, genes])
+# Including marker genes
+sum(zonation_p_val[fdr_cor < fdr_cor_thresh, genes %in% spatial_p56$genes])
+
+# How many genes are expressed?
+mean(colSums(normcounts(normalised) > 0))
+
+# What percentage of expressed genes is this?
+mean(length(zonation_p_val[fdr_cor < fdr_cor_thresh, genes]) / colSums(normcounts(normalised) > 0))
+
+# What percentage of UMI is this?
+hist(colSums(normcounts(normalised[zonation_p_val[fdr_cor < fdr_cor_thresh, genes],])))
+mean(colSums(normcounts(normalised[zonation_p_val[fdr_cor < fdr_cor_thresh, genes],])) / colSums(normcounts(normalised)))
+
+
+fdr_cor_thresh = 0.05
+# How many genes this gives?
+length(zonation_p_val[fdr_cor < fdr_cor_thresh, genes])
+# Including marker genes
+sum(zonation_p_val[fdr_cor < fdr_cor_thresh, genes %in% spatial_p56$genes])
+
+# How many genes are expressed?
+mean(colSums(normcounts(normalised) > 0))
+
+# What percentage of expressed genes is this?
+mean(length(zonation_p_val[fdr_cor < fdr_cor_thresh, genes]) / colSums(normcounts(normalised) > 0))
+
+# What percentage of UMI is this?
+hist(colSums(normcounts(normalised[zonation_p_val[fdr_cor < fdr_cor_thresh, genes],])))
+mean(colSums(normcounts(normalised[zonation_p_val[fdr_cor < fdr_cor_thresh, genes],])) / colSums(normcounts(normalised)))
+
+# filter non-significant genes out
+zonation_mean = zonation_mean[(genes %in% c("Chrdl1", "Il33", "Id3") |
+                                genes %in% zonation_p_val[fdr_cor < fdr_cor_thresh, genes])]
+
+pp = plot_gradient(zonation_mean, gene_list = zonation_mean$genes,
+                   lm_genes = c("Chrdl1", "Il33", "Id3"), include_lm = T,
+                   n_matching_genes = 150,
+              layer_levels =  layer_levels, normalise = c(TRUE, FALSE, "log10")[1])
+pp$plot
+
+ggplot2::ggsave(pp$plot, width = 20, height = 2.7, units = "in",
+               device = "svg", path = "./figures_Ntotal180k/paper/",
+               filename = paste0("FigSX_all_new_genes_fdr_pval", fdr_cor_thresh, ".svg"))
+```
+
+## Show mean expression and dropout in single cells for p < 0.05 profiles
+
+```{r, fig.height=7, fig.width=20}
+normalised_slot = "ss2_counts"
+
+sc_qual = data.table(sc_mean = Matrix::rowMeans(assay(normalised[pp$gene_order, ], normalised_slot)),
+                     sc_dropout = Matrix::rowMeans(assay(normalised[pp$gene_order, ], normalised_slot) == 0),
+                     gene = factor(pp$gene_order, levels = pp$gene_order))
+
+sc_mean = ggplot(sc_qual, aes(gene, "sc_mean",
+                              fill = log10(sc_mean), color = log10(sc_mean))) +
+    geom_tile() +
+    scale_fill_gradientn(colours=pp$col) +
+    scale_color_gradientn(colours=pp$col) +
+    scale_y_discrete(expand=c(0,0)) +
+    pp$theme_change +
+    guides(fill = guide_colorbar(title.position = "top")) +
+    theme(axis.text.x = element_blank(),
+          legend.direction = "horizontal", legend.position = "top",
+          legend.key.width = unit(30, "pt"))
+
+sc_dropout = ggplot(sc_qual, aes(gene, "sc_dropout",
+                              fill = sc_dropout, color = sc_dropout)) +
+    geom_tile() +
+    scale_fill_gradientn(colours=pp$col) +
+    scale_color_gradientn(colours=pp$col) +
+    scale_y_discrete(expand=c(0,0)) +
+    pp$theme_change +
+    guides(fill = guide_colorbar(title.position = "top")) +
+    theme(axis.text.x = element_blank(),
+          legend.direction = "horizontal", legend.position = "top",
+          legend.key.width = unit(30, "pt"))
+
+cowplot::plot_grid(sc_mean, sc_dropout,
+                   pp$plot + theme(legend.direction = "horizontal",
+                                   legend.position = "top",
+                                   legend.key.width = unit(30, "pt")),
+                   align = "v", ncol = 1, rel_heights = c(1, 1, 2.5))
+```
+
+```{r}
+fwrite(zonation_mean_orig[genes %in% zonation_p_val[fdr_cor < 0.2, genes]], paste0("./results_top_genes/Holt_astr_map_Shalev_p56_UMI_",UMI,"_markers", N_markers, "p_02.csv"))
+fwrite(zonation_mean_orig[genes %in% zonation_p_val[fdr_cor < 0.05, genes]], paste0("./results_top_genes/Holt_astr_map_Shalev_p56_UMI_",UMI,"_markers", N_markers, "p_005.csv"))
+```
+
+## Plot expression across zones - most similar to markers
+
+```{r, fig.height=2.7, fig.width=10}
+p_cutoff = 0.05
+pp = plot_gradient(zonation_mean_orig, gene_list = c(zonation_p_val[fdr_cor < p_cutoff, genes],
+                                                     c("Chrdl1", "Il33", "Id3")),
+              lm_genes = c("Chrdl1", "Il33", "Id3"), include_lm = T,
+              n_matching_genes = 15,
+              layer_levels =  layer_levels)
+pp$plot
+
+ggplot2::ggsave(pp$plot, width = 10, height = 2.7, units = "in",
+               device = "svg", path = "./figures_Ntotal180k/paper/",
+               filename = paste0("Fig4E_15_most_similar_to_markers_fdr_sig", p_cutoff,".svg"))
+
+fwrite(data.table(pp$matching_genes), paste0("./results_top_genes/Holt_astr_map_Shalev_p56_UMI_",UMI,"_markers", N_markers, "15_most_similar2markers_sig", p_cutoff,".csv"),
+       sep = "\t", col.names = F)
+```
+
+## Plot expression across zones - neurotransmission genes
+
+```{r, fig.height=2.7, fig.width=10}
+p_cutoff = 0.05
+
+neurotrans_list = c("Id3", "Chrdl1", "Il33", "Gfap",
+             "Adra1a",
+             "Adra1b",
+             "Adra2a",
+             "Gabbr1",
+             "Grm3",
+             "Grm5",
+             "Drd1",
+             "Drd2",
+             "Slc6a1",
+             "Slc6a11",
+             "Slc1a3",
+             "Slc1a2",
+             "Slc6a3",
+             "Slc6a2",
+             "Hrh1",
+             "Hrh2",
+             "Hrh3",
+             "Gria2", #
+             "Grin2c",
+             "Kcnn2",
+             "Kcnn3",
+             "Itpr2",
+             "Slc7a11",
+             "Chrna7",
+             "Fabp7")
+neurotrans_list = neurotrans_list[neurotrans_list %in% rownames(zonation_mean_orig)]
+
+pp = plot_gradient(zonation_mean_orig, gene_list = c(zonation_p_val[fdr_cor < p_cutoff, genes],
+                                                     c("Chrdl1", "Il33", "Id3")),
+              lm_genes = c("Chrdl1", "Il33", "Id3"), include_lm = T,
+              n_matching_genes = 15,
+              layer_levels =  layer_levels)
+pp$plot
+
+ggplot2::ggsave(pp$plot, width = 10, height = 2.7, units = "in",
+               device = "svg", path = "./figures_Ntotal180k/paper/",
+               filename = paste0("Fig4E_15_most_similar_to_markers_fdr_sig", p_cutoff,".svg"))
+
+fwrite(data.table(pp$matching_genes), paste0("./results_top_genes/Holt_astr_map_Shalev_p56_UMI_",UMI,"_markers", N_markers, "15_most_similar2markers_sig", p_cutoff,".csv"),
+       sep = "\t", col.names = F)
+```
+
+## Show mean expression and dropout in single cells for profiles  most similar to markers
+
+```{r, fig.height=7, fig.width=12}
+sc_qual = data.table(sc_mean = Matrix::rowMeans(assay(normalised[pp$gene_order, ], normalised_slot)),
+                     sc_dropout = Matrix::rowMeans(assay(normalised[pp$gene_order, ], normalised_slot) == 0),
+                     gene = factor(pp$gene_order, levels = pp$gene_order))
+
+sc_mean = ggplot(sc_qual, aes(gene, "sc_mean",
+                              fill = log10(sc_mean), color = log10(sc_mean))) +
+    geom_tile() +
+    scale_fill_gradientn(colours=pp$col) +
+    scale_color_gradientn(colours=pp$col) +
+    scale_y_discrete(expand=c(0,0)) +
+    pp$theme_change +
+    guides(fill = guide_colorbar(title.position = "top")) +
+    theme(axis.text.x = element_blank(),
+          legend.direction = "horizontal", legend.position = "top",
+          legend.key.width = unit(30, "pt"))
+
+sc_dropout = ggplot(sc_qual, aes(gene, "sc_dropout",
+                              fill = sc_dropout, color = sc_dropout)) +
+    geom_tile() +
+    scale_fill_gradientn(colours=pp$col) +
+    scale_color_gradientn(colours=pp$col) +
+    scale_y_discrete(expand=c(0,0)) +
+    pp$theme_change +
+    guides(fill = guide_colorbar(title.position = "top")) +
+    theme(axis.text.x = element_blank(),
+          legend.direction = "horizontal", legend.position = "top",
+          legend.key.width = unit(30, "pt"))
+
+cowplot::plot_grid(sc_mean, sc_dropout,
+                   pp$plot + theme(legend.direction = "horizontal",
+                                   legend.position = "top",
+                                   legend.key.width = unit(30, "pt")),
+                   align = "v", ncol = 1, rel_heights = c(1, 1, 2.5))
+```
+
+## Genes used for spatial mapping - p56
+
+```{r, fig.height=5, fig.width=6.5}
+# observed
+spatial_p56_dt = dcast.data.table(spatial_p56, genes ~ ctxdepthInterval,
+                                  value.var = "spotcounts", fun.aggregate = mean)
+p1 = plot_gradient(spatial_p56_dt, gene_list = unique(spatial_p56$genes),
+              layer_levels = layer_levels) 
+
+# predicted
+p56 = plot_gradient(zonation_mean_orig, gene_list = unique(spatial_p56$genes),
+                   gene_order = p1$gene_order,
+              layer_levels = layer_levels) 
+
+p_o_p = cowplot::plot_grid(p1$plot + ggtitle("observed profile"),
+                   p56$plot + ggtitle("predicted profile"), nrow = 2)
+p_o_p
+
+ggplot2::ggsave(p_o_p, width = 6.5, height = 5, units = "in",
+               device = "svg", path = "./figures_Ntotal180k/paper/",
+               filename = "Fig4D_observed_vs_predicted.svg")
+```
+
+## Leave one out analysis 
+
+```{r, fig.height=8, fig.width=19.5}
+# find which genes were left out
+left_dir = list.dirs("./spatial_mapping_code")
+left_dir = grep("nonscaled", grep(paste0(analysis_name, "_"), left_dir, value = T), invert = T, value = T)
+left_out_genes = gsub(paste0("^\\./spatial_mapping_code/", analysis_name, "_"),
+                      "", left_dir)
+
+plot_list = lapply(seq_along(left_out_genes),  function(ind, gene_order) {
+  # load spatial predictions
+  zon_mean = fread(paste0(left_dir[ind], "/zonation_profile_genes_x_zones.csv"))
+  setnames(zon_mean, colnames(zon_mean), layer_levels)
+  zon_mean$genes = gene_names
+  
+  # change nan to 0
+  zon_mean = as.matrix(zon_mean, rownames = "genes")
+  zon_mean[is.na(zon_mean)] = 0
+  zon_mean = as.data.table(zon_mean, keep.rownames = "genes")
+  
+  zon_mean[genes == left_out_genes[ind], genes := paste0("*", genes, "*")]
+  gene_order[gene_order == left_out_genes[ind]] = paste0("*", gene_order[gene_order == left_out_genes[ind]], "*")
+  
+  p56 = plot_gradient(zon_mean, gene_list = gene_order,
+                      gene_order = gene_order,
+                      layer_levels =  layer_levels) 
+  p56$plot + ggtitle(paste0(left_out_genes[ind], " excluded"))
+}, p1$gene_order) # gene_order comes from the plot in the previous chunk
+
+p = cowplot::plot_grid(plotlist = plot_list)
+p
+
+ggplot2::ggsave(p, width = 19.5, height = 8, units = "in",
+               device = "svg", path = "./figures_Ntotal180k/paper/",
+               filename = "FigSX_individual_leave_one_outs.svg")
+```
+
+```{r, fig.height=2.7, fig.width=8}
+# find which genes were left out
+left_dir = list.dirs("./spatial_mapping_code")
+left_dir = grep(paste0(analysis_name, "_"), left_dir, value = T)
+left_dir = grep(paste0("nonscaled"), left_dir, value = T, invert = T)
+left_out_genes = gsub(paste0("^\\./spatial_mapping_code/", analysis_name, "_"),
+                      "", left_dir)
+
+data_list = lapply(seq_along(left_out_genes),  function(ind) {
+  # load spatial predictions
+  zon_mean = fread(paste0(left_dir[ind], "/zonation_profile_genes_x_zones.csv"))
+  setnames(zon_mean, colnames(zon_mean), layer_levels)
+  zon_mean$genes = gene_names
+  
+  # read in probability weight matrix
+  weight_mat = fread(paste0(left_dir[ind], "/prob_cell_assignment_cells_x_zones_plus1.csv"))
+  setnames(weight_mat, colnames(weight_mat), layer_levels)
+  weight_mat = as.matrix(weight_mat)
+  rownames(weight_mat) = colnames(normalised)
+  # compute posterior probability matrix making probabilities for each cell sum to 1
+  prob_mat = weight_mat / Matrix::rowSums(weight_mat)
+  # remove cells with 0 probabilities (this happens when the likelyhood to see expression profile of this cell given expression in each layer is numerically approaching 0)
+  prob_mat = prob_mat[rowSums(is.na(prob_mat)) < 1, ]
+  
+  # add optional softmax
+  #prob_mat = exp(prob_mat) / Matrix::rowSums(exp(prob_mat))
+  # add optional square and renormalise
+  prob_mat = prob_mat^2 / Matrix::rowSums(prob_mat^2)
+  
+  # normalise each column
+  prob_weight_mat = prob_mat / matrix(rep(Matrix::colSums(prob_mat), nrow(prob_mat)),
+                                      nrow(prob_mat), ncol(prob_mat), byrow = T)
+  
+  # compute zonation matrix
+  sc_seq_data = normcounts(normalised[, rownames(prob_weight_mat)])
+  # 1 normalise scRNA-seq data
+  sc_seq_data = sc_seq_data/ matrix(rep(Matrix::colSums(sc_seq_data), nrow(sc_seq_data)),
+                                      nrow(sc_seq_data), ncol(sc_seq_data), byrow = T)
+  zon_mean = sc_seq_data %*% prob_weight_mat
+  
+  # change nan to 0
+  #zon_mean = as.matrix(zon_mean, rownames = "genes")
+  zon_mean[is.na(zon_mean)] = 0
+  zon_mean = as.data.table(as.matrix(zon_mean), keep.rownames = "genes")
+  
+  zon_mean = zon_mean[genes == left_out_genes[ind]]
+  zon_mean[genes == left_out_genes[ind], genes := paste0("*", genes, "*")]
+  zon_mean = rbind(zon_mean, spatial_p56_dt[genes == left_out_genes[ind]])
+  
+  gene_order = c(paste0("*", left_out_genes[ind], "*"), left_out_genes[ind])
+  
+  # calculate kl divergence
+  d1 = as.numeric(as.matrix(zon_mean[1,], rownames = "genes"))
+  d1 = d1 / sum(d1)
+  d2 = as.numeric(as.matrix(zon_mean[2,], rownames = "genes"))
+  d2 = d2 / sum(d2)
+  LR = ifelse(d1 > 0, log2(d1) - log2(d2), 0)
+  # calculate entropy of the second distribution
+  entropy = -sum(d2 * log2(d2), na.rm = T)
+  
+  list(zon_mean = zon_mean, gene_order = gene_order, kl = d1 %*% LR, entropy = entropy)
+})
+
+zon_mean = rbindlist(lapply(data_list, function(x) x$zon_mean))
+gene_order = unlist(lapply(data_list, function(x) x$gene_order))
+kl = unlist(lapply(data_list, function(x) x$kl))
+entropy = unlist(lapply(data_list, function(x) x$entropy))
+hist(entropy)
+plot(entropy, kl)
+
+p56 = plot_gradient(zon_mean, gene_list = gene_order,
+                    gene_order = gene_order,
+                    layer_levels =  layer_levels) 
+p56$plot + ggtitle("Comparing *reconstructed* to observed profile")
+```
+
+```{r, fig.height=5, fig.width=8}
+gene_order_1 = gsub("\\*", "", p56$gene_order)
+sc_qual = data.table(sc_mean = Matrix::rowMeans(assay(normalised[gene_order_1, ], normalised_slot)),
+                     sc_dropout = Matrix::rowMeans(assay(normalised[gene_order_1, ], normalised_slot) == 0),
+                     kl_divergence = rep(kl, each = 2),
+                     gene = factor(gene_order_1, levels = unique(gene_order_1)))
+
+sc_kl = ggplot(sc_qual, aes(gene, paste0("KL_divergence\nmean ", signif(mean(kl), 2)),
+                              fill = kl_divergence, color = kl_divergence)) +
+    geom_tile() +
+    scale_fill_gradientn(colours=p56$col) +
+    scale_color_gradientn(colours=p56$col) +
+    scale_y_discrete(expand=c(0,0)) +
+    p56$theme_change +
+    guides(fill = guide_colorbar(title.position = "top")) +
+    theme(axis.text.x = element_blank(),
+          legend.direction = "horizontal", legend.position = "top",
+          legend.key.width = unit(30, "pt"))
+
+p = cowplot::plot_grid(sc_kl,
+                   p56$plot + theme(legend.direction = "horizontal",
+                                   legend.position = "top",
+                                   legend.key.width = unit(30, "pt")),
+                   align = "v", ncol = 1, rel_heights = c(1, 2.2))
+p
+
+ggplot2::ggsave(p, width = 8, height = 5, units = "in",
+               device = "svg", path = "./figures_Ntotal180k/paper/",
+               filename = "FigSX_summary_leave_one_outs.svg")
+```
+
+## Genes not used for spatial mapping - p14
+
+```{r, fig.height=5, fig.width=8}
+p14_list = unique(spatial_p14$genes)
+p14_list = p14_list[p14_list %in% zonation_mean_orig$genes]
+
+# observed
+spatial_p14_dt = dcast.data.table(spatial_p14, genes ~ ctxdepthInterval,
+                                  value.var = "spotcounts", fun.aggregate = mean)
+p1 = plot_gradient(spatial_p14_dt, gene_list = p14_list,
+              layer_levels = 1:5)
+
+# predicted
+p2 = plot_gradient(zonation_mean_orig, gene_list = p14_list, 
+                   gene_order = p1$gene_order,
+              layer_levels =  layer_levels)
+
+cowplot::plot_grid(p1$plot + ggtitle("observed profile"),
+                   p2$plot + ggtitle("predicted profile"),
+                   nrow = 2, align = "hv")
+```
+
+## Martin's list
+
+```{r, fig.height=2.7, fig.width=4}
+p14_list = c("Fabp7", "Agt", "Nnat", "Hes5", "Akt2", "Nupr1", "Igfbp2", "Thrsp", "Dhcr7")
+p14_list = p14_list[p14_list %in% zonation_mean_orig$genes]
+
+# observed
+spatial_p14_dt = dcast.data.table(spatial_p14, genes ~ ctxdepthInterval,
+                                  value.var = "spotcounts", fun.aggregate = mean)
+p1 = plot_gradient(spatial_p14_dt, gene_list = p14_list,
+              layer_levels = 1:5) 
+p1$plot + ggtitle("p14 observed profile")
+
+# predicted
+p2 = plot_gradient(zonation_mean_orig, gene_list = p14_list,
+              layer_levels = layer_levels)
+p2$plot + ggtitle("predicted profile")
+```
+
+## Check that the absolute numbers are in the same range
+
+```{r}
+pred_mat = as.matrix(zonation_mean_orig[genes %in% unique(spatial_p56$genes)], rownames = "genes")
+pred_mat = pred_mat * 180000 * 0.15 # fraction of cell UMI * total UMI per cell * smFISH sampling
+#pred_mat
+#rowSums(pred_mat)
+
+obs_mat = as.matrix(spatial_p56_dt, rownames = "genes")
+#obs_mat
+data.table(predicted = rowSums(pred_mat), observed = rowSums(obs_mat)[names(rowSums(pred_mat))],
+           `predicted/observed` = rowSums(pred_mat) / rowSums(obs_mat)[names(rowSums(pred_mat))],
+           genes = rownames(pred_mat))
+
+# look at ratios to find how to correct total number of cells (Ntotal) and Vf
+mean(rowSums(pred_mat) / rowSums(obs_mat)[names(rowSums(pred_mat))])
+```
+
+## Plot probability of cells assigned to cortex layers
+
+```{r, fig.height=13.7, fig.width=16}
+# read in probability weight matrix
+weight_mat = fread(paste0("./spatial_mapping_code/", analysis_name, "/prob_cell_assignment_cells_x_zones_plus1.csv"))
+setnames(weight_mat, colnames(weight_mat), layer_levels)
+normalised$pred_layer = sapply(apply(weight_mat, 1, which.max), function(x) colnames(weight_mat)[x])
+# how many cells map to each layer? (hard assignment)
+table(normalised$pred_layer)
+
+weight_mat = as.matrix(weight_mat)
+rownames(weight_mat) = colnames(normalised)
+
+# compute posterior probability matrix making probabilities for each cell sum to 1
+prob_mat = weight_mat / Matrix::rowSums(weight_mat)
+# remove cells with 0 probabilities (this happens when the likelyhood to see expression profile of this cell given expression in each layer is numerically approaching 0)
+prob_mat = prob_mat[rowSums(is.na(prob_mat)) < 1, ]
+
+# add optional softmax - makes probabilities more even
+# prob_mat = exp(prob_mat) / Matrix::rowSums(exp(prob_mat))
+# add optional square and renormalise
+#prob_mat = prob_mat^2 / Matrix::rowSums(prob_mat^2)
+
+# calculate how spread out profiles are using entropy
+spread_of_profiles = -rowSums(prob_mat * log2(prob_mat), na.rm = T)
+saveRDS(spread_of_profiles, paste0("./spatial_mapping_code/", analysis_name, "/cell_assignment_entropy.RDS"))
+
+# save posterior probability matrix
+prob_mat_dt = as.data.table(prob_mat, keep.rownames = "cell_id")
+fwrite(prob_mat_dt, "./figures_Ntotal180k/Supplementary_table_10.tsv", sep = "\t")
+
+# plot entropy
+## choose entropy intervals
+if(UMI){
+  ent_int = c(0.3, 0.8, 1.4)
+} else {
+  ent_int = c(0.1, 0.6, 0.9)
+}
+
+entropy = qplot(spread_of_profiles, geom = "histogram") +
+  geom_vline(xintercept = ent_int, size = 6, alpha = 0.5) +
+  geom_text(aes(x = ent_int + 0.15, y = 70, 
+                label = c("D", "E", "F")), size = 8) +
+  xlab("Uncertainty in cell assignment to layers (entropy)") + ylab("Cell count")
+entropy
+
+if(!(N_markers == 16 & !UMI)){
+# plot entropy vs total number of reads per cell
+normalised_slot = "counts" # "counts"  ss2_counts
+upper_bin = 300#6e4
+
+N_reads = Matrix::colSums(assay(normalised[, names(spread_of_profiles)], normalised_slot))
+N_reads_vs_ent = qplot(x = N_reads, y = spread_of_profiles, geom = "bin2d") +
+  scale_fill_gradientn(colours = p1$col) +
+  scale_color_gradientn(colours = p1$col) +
+  geom_text(aes(x = 7000, y = 2,
+                label = paste0("cor: ", signif(cor(N_reads, spread_of_profiles), 2))),
+            size = 8) +
+  xlab("scRNA-seq coverage per cell, number of reads") +
+  ylab("Uncertainty in cell assignment to layers (entropy)")
+
+# plot entropy vs number of marker gene reads per cell
+N_reads_mark = Matrix::colSums(assay(normalised[unique(spatial_p56$genes), names(spread_of_profiles)], normalised_slot))
+N_mark_reads_vs_ent = qplot(x = N_reads_mark, y = spread_of_profiles, geom = "bin2d") +
+  scale_fill_gradientn(colours = p1$col) +
+  scale_color_gradientn(colours = p1$col) +
+  geom_text(aes(x = 200, y = 2,
+                label = paste0("cor: ", signif(cor(N_reads_mark, spread_of_profiles), 2))),
+            size = 8) +
+  xlab("scRNA-seq coverage of spatial markers, number of reads") +
+  theme(axis.title.y = element_blank())
+
+set.seed(10)
+# cells from entropy bins
+c1_p = plot_cell_prob(prob_mat, spread_of_profiles, normalised[unique(spatial_p56$genes),],
+                      sce_slot = normalised_slot, limits_num_reads = c(0, upper_bin),
+                      min = ent_int[1], max = ent_int[1] + 0.1, n_cells = 15,
+                      layer_levels = layer_levels)
+c2_p = plot_cell_prob(prob_mat, spread_of_profiles, normalised[unique(spatial_p56$genes),],
+                      sce_slot = normalised_slot, limits_num_reads = c(0, upper_bin),
+                      min = ent_int[2], max = ent_int[2] + 0.1, n_cells = 15,
+                      layer_levels = layer_levels)
+c3_p = plot_cell_prob(prob_mat, spread_of_profiles, normalised[unique(spatial_p56$genes),],
+                      sce_slot = normalised_slot, limits_num_reads = c(0, upper_bin),
+                      min = ent_int[3], max = ent_int[3] + 0.1, n_cells = 15,
+                      layer_levels = layer_levels)
+
+# combined plot - cells
+c_p = cowplot::plot_grid(c1_p, c2_p, c3_p,
+                   ncol = 3, align = "h")
+c_p
+
+# combine entropy plots
+entropy = cowplot::plot_grid(grid::grob(), entropy,
+                             grid::grob(), N_reads_vs_ent,
+                             grid::grob(), N_mark_reads_vs_ent,
+                   ncol = 6, rel_widths = c(0.05, 1, 0.1, 1, 0.05, 1), align = "h")
+}
+# plot all cells
+all_cells = as.data.table(prob_mat, keep.rownames = "genes")
+c_all_p = plot_gradient(all_cells, gene_list = all_cells$genes, limits = c(0, 1),
+                        gene_order = all_cells$genes[order(spread_of_profiles)],
+              layer_levels = layer_levels) 
+c_all_p = c_all_p$plot + theme(axis.text.x = element_blank()) +
+    labs(fill = "Probability", color = "Probability")
+c_all_p = cowplot::plot_grid(grid::grob(), c_all_p, ncol = 2, rel_widths = c(0.03, 1))
+c_all_p
+
+ggplot2::ggsave(c_all_p,
+                width = 16, height = 2.7, units = "in", 
+               device = "svg", path = "./figures_Ntotal180k/poster/",
+               filename = "cell_assignment_to_layers.svg")
+  
+if(!(N_markers == 16 & !UMI)){
+# combined plot - entropy & cells
+p = cowplot::plot_grid(entropy, grid::grob(), c_p,  grid::grob(), c_all_p, nrow = 5,
+                   rel_heights = c(1, 0.1, 1,  0.1, 0.4)) +
+  cowplot::draw_text(c("D", "E", "F"), size = 20,
+                     x = c(0, 0.33, 0.66) + 0.02, y = 0.55) +
+  cowplot::draw_text(c("A", "B", "C"), size = 20, x = c(0.02, 0.35, 0.68), y = 0.98) +
+  cowplot::draw_text(c("G"), size = 20, x = c(0.02), y = 0.16)
+}
+
+ggplot2::ggsave(p, width = 16, height = 13.7, units = "in", 
+               device = "svg", path = "./figures_Ntotal180k/",
+               filename = "cell_assignment_to_layers_panel.svg")
+p
+```
+
+Assessing the quality of single cell mapping to layers.  
+A. Entropy of probabilities of each cell belonging to each layer reflects uncertainty in assignment. Plot shows the distribution (Y-axis) of entropy (X-axis) across single cells. Example cells with uncertainty in mapping marked by vertical bars are shown in panels D, E and F respectively.    
+B. Total sequencing coverage of single cells is unrelated to uncertainty in assignment. Number of cells (color) with each combination of the total number of reads (X-axis) and uncertainty in assignment to layers (Y-axis) is shown.    
+C. Cells with higher coverage of spatial marker genes have more certain assignment to layers. Number of cells (color) with each combination of the number of marker gene reads (X-axis) and uncertainty in assignment to layers (Y-axis) is shown.    
+D, E and F heatmaps show probabilities (color) of 15 cells (X-axis) belonging to each layer (Y-axis). Cells were randomly sampled from entropy bins marked by vertical bars in panel A. Top bar shows the number of marker gene reads (color) for each cell.    
+G. Heatmap shows the probabilities (color) of all cells (X-axis) belonging to each layer (Y-axis).  
+
+# producing figure for poster
+
+```{r plot_cell_prob, fig.height=7, fig.width=5}
+set.seed(10)
+# cells from entropy bins
+c1_p = plot_cell_prob_and_mark(prob_mat, spread_of_profiles, normalised[unique(spatial_p56$genes),],
+                      sce_slot = normalised_slot,
+                      min = ent_int, max = ent_int + 0.1, n_cells = 5,
+                      layer_levels = layer_levels, normalise = F,
+                      markers = unique(spatial_p56$genes)[unique(spatial_p56$genes) != "Mfge8"])
+c1_p 
+ggplot2::ggsave(c1_p, width = 5, height = 7, units = "in",
+               device = "svg", path = "./figures_Ntotal180k/poster/",
+               filename = "method3_profiles_prob.svg")
+```
+
+# producing figure for poster
+
+```{r plot_cell_prob_new, fig.height=7, fig.width=5}
+# New genes - get top 3 similar to markers
+pp = plot_gradient(zonation_mean, gene_list = c(zonation_p_val[fdr_cor < 0.05, genes],
+                                                     c("Chrdl1", "Il33", "Id3")),
+              lm_genes = c("Chrdl1", "Eogt", "Il33", "Id3"), include_lm = F,
+              n_matching_genes = 5,
+              layer_levels =  layer_levels)
+
+new_g = c("Nwd1", "Agt", "Nkain4", "Nat8f1", "Dhrs7", "Hes5", "Cyr61", "Prelp", "Wls", "Pmp22", "Akt2", "Apln")
+# cells from entropy bins
+c1_p = plot_cell_prob_and_mark(prob_mat, spread_of_profiles, normalised[new_g,],
+                               sce_slot = normalised_slot,
+                               min = ent_int, max = ent_int + 0.1, n_cells = 5,
+                               layer_levels = layer_levels, normalise = F,
+                               markers = new_g)
+c1_p 
+ggplot2::ggsave(c1_p, width = 5, height = 7, units = "in",
+                device = "svg", path = "./figures_Ntotal180k/poster/",
+                filename = "method3_profiles_prob_new_g.svg")
+
+c1_p2 = plot_cell_prob_and_mark(prob_mat, spread_of_profiles, normalised[new_g,],
+                               sce_slot = normalised_slot,
+                               min = ent_int, max = ent_int + 0.1, n_cells = 5,
+                               layer_levels = layer_levels, normalise = F,
+                               markers = new_g, flip_cells = T)
+c1_p2 
+ggplot2::ggsave(c1_p2, width = 1.8, height = 10, units = "in",
+                device = "svg", path = "./figures_Ntotal180k/poster/",
+                filename = "method3_profiles_prob_new_g_flip.svg")
+
+
+
+pp = plot_gradient(zonation_mean, gene_list = new_g,
+                   gene_order = new_g[length(new_g):1],
+                   layer_levels =  layer_levels, normalise = T)
+pp$plot + coord_flip()
+
+ggplot2::ggsave(pp$plot + coord_flip(), width = 3.3, height = 3, units = "in",
+                device = "svg", path = "./figures_Ntotal180k/poster/",
+                filename = "gene_profiles_new_g.svg")
+```
+

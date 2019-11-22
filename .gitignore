@@ -1,0 +1,5 @@
+.Rproj.user
+.DS_Store
+data/Holt_astrocytes/HOLTLAB_LnNormData_Cortex.tsv
+data/Holt_astrocytes/HOLTLAB_Counts_Cortex.tsv
+spatial_mapping_code/matlab.mat
